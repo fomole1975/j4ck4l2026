@@ -15,9 +15,6 @@
 #include <exception>
 #include <iostream>
 #include <limits>
-#include <memory>
-#include <cstring>
-#include <string_view>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -376,71 +373,6 @@ inline Purchase event_purchase(uint64_t event) {
 inline int64_t click_time(const TimedClick& click, int64_t) { return click.ts; }
 inline int64_t click_time(const ShortClick& click, int64_t base) { return base - week_ms + click.offset; }
 
-// Generator event IDs are "e" followed by base 36 of an invertible 40-bit
-// scramble of the event's position. Decoding a canonical base-36 suffix is an
-// exact, injective function of the ID string, so the result only chooses where
-// a row is placed: rows of one ID always meet, whichever key was inferred.
-constexpr uint64_t odd_inverse(uint64_t a) {
-    uint64_t x = a;
-    for (int i = 0; i < 6; ++i)
-        x *= 2 - a * x;
-    return x;
-}
-struct EventIndexer {
-    static constexpr uint64_t none = UINT64_MAX;
-    static constexpr uint64_t mask40 = (uint64_t{1} << 40) - 1;
-    static constexpr uint64_t mul_a = UINT64_C(0x9E3779B97F4B) & mask40;
-    static constexpr uint64_t mul_b = UINT64_C(0xD6E8FEB86659) & mask40;
-    static constexpr uint64_t inv_a = odd_inverse(mul_a) & mask40, inv_b = odd_inverse(mul_b) & mask40;
-    static_assert(((mul_a * inv_a) & mask40) == 1 && ((mul_b * inv_b) & mask40) == 1);
-
-    uint64_t key = 0, limit = 0;
-    unsigned bits = 0;
-
-    // The base-36 value of a literal's bytes (first character in the low
-    // byte), or none for any other character, a leading zero or > 40 bits.
-    static uint64_t value(uint64_t literal) {
-        if (!literal || ((literal & 0xff) == '0' && literal > 0xff))
-            return none;
-        constexpr uint64_t ones = UINT64_C(0x0101010101010101), high = ones * 0x80;
-        if (literal & high)
-            return none;
-        const unsigned n = (71 - std::countl_zero(literal)) / 8;
-        const uint64_t lanes = n == 8 ? high : high & ((uint64_t{1} << (8 * n)) - 1);
-        const auto at_least = [&](unsigned lo) { return (literal + ones * (0x80 - lo)) & high; };
-        const uint64_t digit = at_least('0') & ~at_least('9' + 1);
-        const uint64_t lower = at_least('a') & ~at_least('z' + 1);
-        if (((digit | lower) & lanes) != lanes)
-            return none;
-        const uint64_t digit_lanes = (digit >> 7) * 0xff, lower_lanes = (lower >> 7) * 0xff;
-        uint64_t d = literal - ((digit_lanes & (ones * '0')) | (lower_lanes & (ones * ('a' - 10))));
-        d <<= 8 * (8 - n);
-        d = (d & UINT64_C(0x00ff00ff00ff00ff)) * 36 + ((d >> 8) & UINT64_C(0x00ff00ff00ff00ff));
-        d = (d & UINT64_C(0x0000ffff0000ffff)) * 1296 + ((d >> 16) & UINT64_C(0x0000ffff0000ffff));
-        const uint64_t y = (d & 0xffffffff) * 1679616 + (d >> 32);
-        return y <= mask40 ? y : none;
-    }
-    static uint64_t unmix(uint64_t y) {
-        const uint64_t x = (y * inv_b) & mask40;
-        return x ^ (x >> 17) ^ (x >> 34);
-    }
-    uint64_t index(uint64_t literal) const {
-        const uint64_t y = value(literal);
-        if (y == none)
-            return none;
-        const uint64_t v = ((unmix(y) ^ key) * inv_a) & mask40;
-        return v < limit ? v : none;
-    }
-};
-
-// One well-formed event row placed by its decoded ID. Invalid rows keep a zero
-// user so that, as the earliest copy, they still suppress later copies.
-struct IndexedRow {
-    std::array<uint32_t, 2> user;
-    uint32_t offset, amount, ingest, slot;
-};
-static_assert(sizeof(IndexedRow) == 24);
-
 template <class T> using Partitions = std::vector<std::vector<T>>;
 struct Local {
     Partitions<Candidate> candidates;
@@ -451,7 +383,6 @@ struct Local {
     Partitions<Click> clicks;
     std::vector<TimedEvent> event_extras;
     std::vector<int64_t> wide_click_times;
-    Partitions<IndexedRow> indexed;
 
     Local(size_t n) : candidates(n), literals(literal_shards), events(n), purchases(n), clicks(n) {}
 
@@ -1099,7 +1030,7 @@ template <bool Compact> struct UserBlocks {
 template <bool Compact>
 void group_by_raw_id(std::vector<Local>& locals, size_t shard, unsigned shard_bits, const Aliases& aliases,
                      int64_t window_start, UserBlocks<Compact>& blocks,
-                     Partitions<typename UserBlocks<Compact>::Span>& destinations, bool keep_click_singles) {
+                     Partitions<typename UserBlocks<Compact>::Span>& destinations) {
     size_t ne = 0, nc = 0;
     for (auto& local : locals) {
         ne += local.events[shard].size();
@@ -1252,9 +1183,7 @@ void group_by_raw_id(std::vector<Local>& locals, size_t shard, unsigned shard_bi
         const uint32_t person = aliases.person(group.user);
         using Label = typename UserBlocks<Compact>::Label;
         const auto event_count = group.event_end - first_event, click_count = group.click_end - first_click;
-        // Indexed event rows of an unlinked ID arrive separately, so its
-        // clicks must travel even when this shard holds none of its events.
-        if (person != absent || event_count || (keep_click_singles && click_count)) {
+        if (person != absent || event_count) {
             auto &writer = person == absent ? blocks.singles : destinations[person & mask];
             writer.push_back({person == absent ? Label(group.user) : Label(person),
                               event_count ? events.data() + first_event : nullptr,
@@ -1266,186 +1195,18 @@ void group_by_raw_id(std::vector<Local>& locals, size_t shard, unsigned shard_bi
     }
 }
 
-// Infer the per-dataset scramble key from a few leading event IDs. Every
-// generator ID lies below the expected event count, so a candidate key must
-// map most samples below the limit. Two samples pre-filter each candidate.
-std::optional<uint64_t> recover_event_key(const InputFiles& input, uint64_t limit, unsigned workers) {
-    using I = EventIndexer;
-    std::vector<uint64_t> samples;
-    for (size_t c = 0; c < input.events.size() && samples.size() < 64; ++c) {
-        auto text = input.events[c].aligned();
-        for (int line = 0; line < 8 && !text.empty() && samples.size() < 64; ++line) {
-            const auto newline = text.find('\n');
-            const auto row = text.substr(0, newline);
-            text = newline == text.npos ? std::string_view{} : text.substr(newline + 1);
-            auto id = row.substr(0, row.find(','));
-            if (id.size() >= 2 && id.front() == '"' && id.back() == '"')
-                id = id.substr(1, id.size() - 2);
-            if (id.size() < 2 || id.size() > 9 || id[0] != 'e')
-                continue;
-            uint64_t literal = 0;
-            std::memcpy(&literal, id.data() + 1, id.size() - 1);
-            if (const auto y = I::value(literal); y != I::none)
-                samples.push_back(I::unmix(y));
-        }
-    }
-    if (samples.size() < 8 || limit > (uint64_t{1} << 32))
-        return std::nullopt;
-    auto fits = [&](uint64_t key) {
-        size_t good = 0;
-        for (const auto m : samples)
-            good += (((m ^ key) * I::inv_a) & I::mask40) < limit;
-        return good * 4 >= samples.size() * 3;
-    };
-    for (size_t attempt = 0; attempt + 1 < samples.size() && attempt < 6; attempt += 2) {
-        const uint64_t m0 = samples[attempt], m1 = samples[attempt + 1];
-        std::atomic<uint64_t> found{I::none};
-        const size_t jobs = size_t{workers} * 8, span = (limit + jobs - 1) / jobs;
-        parallel_jobs(workers, jobs, [&](unsigned, size_t job) {
-            uint64_t v = job * span;
-            const uint64_t end = std::min<uint64_t>(limit, v + span);
-            uint64_t product = (v * I::mul_a) & I::mask40;
-            for (; v < end; ++v, product = (product + I::mul_a) & I::mask40) {
-                const uint64_t key = m0 ^ product;
-                if ((((m1 ^ key) * I::inv_a) & I::mask40) < limit && fits(key)) {
-                    found.store(key, std::memory_order_relaxed);
-                    return;
-                }
-                if ((v & 0xffff) == 0 && found.load(std::memory_order_relaxed) != I::none)
-                    return;
-            }
-        });
-        if (found.load() != I::none)
-            return found.load();
-    }
-    return std::nullopt;
-}
-
-using CompactSpan = UserBlocks<true>::Span;
-struct IndexScratch {
-    struct Entry {
-        uint64_t bits = 0;
-        uint32_t person = absent;
-    };
-    struct Placed {
-        uint64_t user;
-        uint32_t offset, amount;
-    };
-    std::vector<uint32_t> ingest, pending;
-    std::vector<Placed> placed;
-    std::array<Entry, 1024> cache{};
-};
-
-// Place one index range's rows by slot. The earliest ingestion wins each slot.
-// Walking slots in order then yields every generator person's events already
-// time-ordered; consecutive events of one person become one span.
-std::unique_ptr<uint32_t[]> index_partition(std::vector<Local>& locals, size_t p, unsigned bits,
-                                            const Aliases& aliases, size_t mask, IndexScratch& scratch,
-                                            Partitions<CompactSpan>& linked, Partitions<CompactSpan>& singles) {
-    constexpr uint32_t empty = UINT32_MAX;
-    const size_t range = size_t{1} << bits;
-    auto& ingest = scratch.ingest;
-    auto& placed = scratch.placed;
-    if (ingest.size() != range) {
-        ingest.assign(range, empty);
-        placed.resize(range);
-    }
-    size_t n = 0, purchases = 0;
-    for (auto& local : locals) {
-        const auto& rows = local.indexed[p];
-        n += rows.size();
-        for (const auto& row : rows) {
-            purchases += row.amount != 0;
-            if (row.ingest < ingest[row.slot]) {
-                ingest[row.slot] = row.ingest;
-                placed[row.slot] = {std::bit_cast<uint64_t>(row.user), row.offset, row.amount};
-            }
-        }
-        std::vector<IndexedRow>().swap(local.indexed[p]);
-    }
-    if (!n)
-        return nullptr;
-    std::unique_ptr<uint32_t[]> out(new uint32_t[2 * n + 2 * purchases + 1]);
-    using Label = UserBlocks<true>::Label;
-    uint32_t cursor = 0, run_start = 0;
-    bool active = false, run_linked = false;
-    uint64_t run_label = 0;
-    auto& pending = scratch.pending;
-    pending.clear();
-    auto close = [&] {
-        const uint32_t count = cursor - run_start;
-        out[cursor++] = static_cast<uint32_t>(pending.size() / 2);
-        for (const auto x : pending)
-            out[cursor++] = x;
-        pending.clear();
-        if (run_linked) {
-            linked[run_label & mask].push_back(
-                {Label(static_cast<uint32_t>(run_label)), out.get() + run_start, nullptr, count, 0});
-        } else {
-            const Key user = Key::from_packed_ascii(run_label);
-            singles[user.hash() & mask].push_back({Label(user), out.get() + run_start, nullptr, count, 0});
-        }
-    };
-    auto cache_slot = [&](uint64_t user) -> IndexScratch::Entry& {
-        return scratch.cache[(user * UINT64_C(0x9e3779b97f4a7c15)) >> 54];
-    };
-    constexpr size_t ahead = 64;
-    for (size_t s = 0; s < range; ++s) {
-        // Warm the alias table for a user that the cache cannot answer.
-        if (s + ahead < range && ingest[s + ahead] != empty) {
-            const uint64_t future = placed[s + ahead].user;
-            if (future && cache_slot(future).bits != future)
-                aliases.prefetch(Key::from_packed_ascii(future));
-        }
-        if (ingest[s] == empty)
-            continue;
-        ingest[s] = empty;
-        const auto& row = placed[s];
-        const uint64_t user = row.user;
-        if (!user)
-            continue;
-        auto& entry = cache_slot(user);
-        if (entry.bits != user) {
-            entry.bits = user;
-            entry.person = aliases.person(Key::from_packed_ascii(user));
-        }
-        const bool is_linked = entry.person != absent;
-        const uint64_t label = is_linked ? entry.person : user;
-        if (!active || is_linked != run_linked || label != run_label) {
-            if (active)
-                close();
-            active = true;
-            run_linked = is_linked;
-            run_label = label;
-            run_start = cursor;
-        }
-        out[cursor++] = row.offset;
-        if (row.amount) {
-            pending.push_back(row.offset);
-            pending.push_back(row.amount);
-        }
-    }
-    if (active)
-        close();
-    return out;
-}
-
 template <bool Compact>
 void sessionize(std::vector<Local>& locals, const Aliases& aliases, int64_t start, unsigned workers, size_t shards,
-                std::vector<SessionState>& states, std::vector<CampaignTotals>& totals, Result& result,
-                std::vector<Partitions<typename UserBlocks<Compact>::Span>> linked_spans = {},
-                const std::vector<Partitions<typename UserBlocks<Compact>::Span>>* extra_singles = nullptr) {
+                std::vector<SessionState>& states, std::vector<CampaignTotals>& totals, Result& result) {
     using Blocks = UserBlocks<Compact>;
     using Span = typename Blocks::Span;
     using EventRow = typename Blocks::EventRow;
     using ClickRow = typename Blocks::ClickRow;
     std::vector<Blocks> sources(shards);
-    std::vector<Partitions<Span>> destinations = std::move(linked_spans);
-    if (destinations.empty())
-        destinations.assign(workers, Partitions<Span>(shards));
+    std::vector<Partitions<Span>> destinations(workers, Partitions<Span>(shards));
     struct alignas(64) Workspace {
         std::vector<uint32_t> offsets;
-        std::vector<Span> spans, singles;
+        std::vector<Span> spans;
         std::vector<uint64_t> event_scratch, purchases;
         BucketSummary summary;
         std::vector<ClickRow> click_scratch, merged_clicks;
@@ -1462,8 +1223,7 @@ void sessionize(std::vector<Local>& locals, const Aliases& aliases, int64_t star
         for (size_t first = 0; first < spans.size();) {
             const auto& group = spans[first];
             size_t end = first + 1, ne = group.event_count, nc = group.click_count;
-            while (end < spans.size() && (Unlinked ? spans[end].label.name == group.label.name
-                                                    : spans[end].label.person == group.label.person)) {
+            while (!Unlinked && end < spans.size() && spans[end].label.person == group.label.person) {
                 ne += spans[end].event_count;
                 nc += spans[end].click_count;
                 ++end;
@@ -1529,11 +1289,9 @@ void sessionize(std::vector<Local>& locals, const Aliases& aliases, int64_t star
                         for (uint32_t j = 0; j < count; ++j, side += 2)
                             purchases.push_back((uint64_t{side[0]} << 32) | side[1]);
                     }
-                    // Index-placed spans arrive in time order already.
-                    if (purchases.size() > 1 && !std::is_sorted(purchases.begin(), purchases.end()))
+                    if (purchases.size() > 1)
                         sort_packed_events(purchases.data(), purchases.size(), event_scratch);
-                    if (!std::is_sorted(events, events + ne))
-                        sort_compact_times(events, ne);
+                    sort_compact_times(events, ne);
                     if (nc > 2)
                         sort_compact_clicks(clicks, nc, click_scratch);
                 } else {
@@ -1553,7 +1311,7 @@ void sessionize(std::vector<Local>& locals, const Aliases& aliases, int64_t star
     };
     parallel_jobs(workers, shards, [&](unsigned worker, size_t shard) {
         group_by_raw_id<Compact>(locals, shard, std::countr_zero(shards), aliases, start, sources[shard],
-                                 destinations[worker], extra_singles != nullptr);
+                                 destinations[worker]);
     });
     const auto shard_bits = std::countr_zero(shards);
     parallel_jobs(workers, shards, [&](unsigned worker, size_t shard) {
@@ -1576,26 +1334,14 @@ void sessionize(std::vector<Local>& locals, const Aliases& aliases, int64_t star
                 linked[offsets[span.label.person >> shard_bits]++] = span;
         // Each person usually spans one or two output days. Reserving avoids
         // repeatedly copying this shard's rows while they are appended.
-        std::span<Span> singles = sources[shard].singles;
-        if (extra_singles) {
-            // One unlinked ID may have spans from several index ranges and
-            // from its click shard. Adjacent equal names are merged.
-            auto& all = workspaces[worker].singles;
-            all.assign(singles.begin(), singles.end());
-            for (const auto& writer : *extra_singles)
-                all.insert(all.end(), writer[shard].begin(), writer[shard].end());
-            std::sort(all.begin(), all.end(),
-                      [](const Span& a, const Span& b) { return a.label.name.bits() < b.label.name.bits(); });
-            singles = all;
-        }
-        result.users[shard].reserve(2 * (linked.size() + singles.size()) + 16);
+        result.users[shard].reserve(2 * (linked.size() + sources[shard].singles.size()) + 16);
         process_histories.template operator()<false>(linked, worker, shard);
-        process_histories.template operator()<true>(singles, worker, shard);
+        process_histories.template operator()<true>(sources[shard].singles, worker, shard);
     });
 }
 } // namespace
 
-std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers, bool allow_index) {
+Result run_engine(const InputFiles& input, unsigned workers) {
     auto last = std::chrono::steady_clock::now();
     auto mark = [&](const char* name) {
         if (std::getenv("PROFILE")) {
@@ -1618,51 +1364,6 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
     for (unsigned i = 0; i < workers; ++i)
         locals.emplace_back(nshards);
     EventLocations addresses(workers, nshards);
-    const bool compact_window = input.window.end - input.window.start <= int64_t{UINT32_MAX} - week_ms;
-    const char* index_setting = std::getenv("SHOPPING_INDEX");
-    bool indexed = allow_index && compact_window && dim.categories.size() <= uint32_t{UINT8_MAX} + 1 &&
-                   !(index_setting && std::string_view(index_setting) == "off");
-    EventIndexer indexer;
-    size_t partitions = 0;
-    if (indexed) {
-        // Typical rows exceed 60 bytes, so this overestimates the ID range.
-        const uint64_t expected = event_bytes / 60 + 1024;
-        indexer.bits = std::clamp<unsigned>(std::bit_width(expected >> 10), 10, 16);
-        partitions = (expected >> indexer.bits) + 1;
-        indexer.limit = uint64_t{partitions} << indexer.bits;
-        if (const auto key = recover_event_key(input, indexer.limit, workers))
-            indexer.key = *key;
-        else
-            indexed = false;
-    }
-    if (!indexed)
-        partitions = 0;
-    if (indexed) {
-        const size_t per_worker = (size_t{1} << indexer.bits) / workers;
-        for (auto& local : locals) {
-            local.indexed.resize(partitions);
-            for (auto& rows : local.indexed)
-                rows.reserve(per_worker + per_worker / 8 + 16);
-        }
-    }
-    mark("index");
-    std::atomic<bool> index_failed{false};
-    const uint64_t slot_mask = (uint64_t{1} << indexer.bits) - 1;
-    // Places a row by decoded ID; false leaves it to the general path.
-    auto place = [&](Local& local, uint64_t literal, Key user, int64_t ts, uint32_t amount, int64_t ingest) {
-        if (!indexed)
-            return false;
-        const uint64_t v = indexer.index(literal);
-        if (v == EventIndexer::none)
-            return false;
-        if (ingest < 0 || ingest % 1000 || ingest / 1000 >= UINT32_MAX)
-            index_failed.store(true, std::memory_order_relaxed);
-        local.indexed[v >> indexer.bits].push_back(
-            {std::bit_cast<std::array<uint32_t, 2>>(user.bits()),
-             user.bits() ? static_cast<uint32_t>(ts - input.window.start) : 0, amount,
-             static_cast<uint32_t>(ingest / 1000), static_cast<uint32_t>(v & slot_mask)});
-        return true;
-    };
     // Leave headroom for workers that finish more input chunks. A little extra
     // reservation avoids doubling thousands of partitions partway through parsing.
     const size_t estimate = event_bytes / (64 * nshards * workers);
@@ -1679,18 +1380,6 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
         }
         auto& local = locals[worker];
         auto general = [&](const EventInput &e) {
-            if (indexed) {
-                const uint64_t literal = e.literal_id ? e.literal_id : event_literal(e.id);
-                Key user;
-                uint32_t amount = 0;
-                if (e.valid) {
-                    user = e.packed_user ? Key::from_packed_ascii(e.packed_user) : Key(e.user);
-                    if (e.price)
-                        amount = e.price | (dim.product_category.get(e.product, 0) << 24);
-                }
-                if (place(local, literal, user, e.ts, amount, e.ingest))
-                    return;
-            }
             uint64_t location = EventLocations::invalid;
             if (e.valid) {
                 Key user = e.packed_user ? Key::from_packed_ascii(e.packed_user) : Key(e.user);
@@ -1709,8 +1398,6 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
             }
         };
         auto basic = [&](uint64_t user_bits, uint64_t literal, int64_t time, int64_t ingest) {
-            if (place(local, literal, Key::from_packed_ascii(user_bits), time, 0, ingest))
-                return;
             uint64_t location = EventLocations::invalid;
             if (user_bits) {
                 const auto user = Key::from_packed_ascii(user_bits);
@@ -1725,8 +1412,6 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
         for_events(input.events[task - 1], input.window, sink);
     });
     mark("events+links");
-    if (index_failed.load())
-        return std::nullopt;
     const int64_t click_start = input.window.start - week_ms;
     const bool compact_clicks = input.window.end - input.window.start <= int64_t{UINT32_MAX} - week_ms;
     // Estimate records from uniformly spaced physical chunks. This keeps
@@ -1752,20 +1437,8 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
             for (auto &rows : local.clicks)
                 rows.reserve(capacity);
     }
-    std::vector<Partitions<CompactSpan>> index_linked, index_singles;
-    std::vector<std::unique_ptr<uint32_t[]>> index_blocks(partitions);
-    std::vector<IndexScratch> index_scratch(indexed ? workers : 0);
-    if (indexed) {
-        index_linked.assign(workers, Partitions<CompactSpan>(nshards));
-        index_singles.assign(workers, Partitions<CompactSpan>(nshards));
-    }
-    const size_t index_first = input.clicks.size() + literal_shards + nshards;
-    parallel_jobs(workers, index_first + partitions, [&](unsigned worker, size_t task) {
-        if (task >= index_first) {
-            const size_t p = task - index_first;
-            index_blocks[p] = index_partition(locals, p, indexer.bits, *aliases, mask, index_scratch[worker],
-                                              index_linked[worker], index_singles[worker]);
-        } else if (task < input.clicks.size()) {
+    parallel_jobs(workers, input.clicks.size() + literal_shards + nshards, [&](unsigned worker, size_t task) {
+        if (task < input.clicks.size()) {
             auto& local = locals[worker];
             auto general = [&](const ClickInput &c) {
                 const auto campaign = dim.campaign_index.get(c.campaign, absent);
@@ -1803,10 +1476,7 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
         states.emplace_back(dim);
     }
     const bool compact = compact_clicks && dim.categories.size() <= uint32_t{UINT8_MAX} + 1;
-    if (compact && indexed)
-        sessionize<true>(locals, *aliases, input.window.start, workers, nshards, states, totals, result,
-                         std::move(index_linked), &index_singles);
-    else if (compact)
+    if (compact)
         sessionize<true>(locals, *aliases, input.window.start, workers, nshards, states, totals, result);
     else
         sessionize<false>(locals, *aliases, input.window.start, workers, nshards, states, totals, result);
@@ -1827,13 +1497,5 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
     result.channel_names = std::move(dim.channels);
     mark("sessions");
     return result;
-}
-
-Result run_engine(const InputFiles& input, unsigned workers) {
-    // A row outside the compact indexed representation restarts the exact
-    // general implementation; no output has been written at that point.
-    if (auto result = run_engine_once(input, workers, true))
-        return std::move(*result);
-    return std::move(*run_engine_once(input, workers, false));
 }
 } // namespace shopping
