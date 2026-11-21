@@ -33,6 +33,7 @@ unsigned worker_count() {
 }
 
 int main() {
+    const auto wall_main = std::chrono::system_clock::now();
     try {
         const auto start = std::chrono::steady_clock::now();
         const unsigned workers = worker_count();
@@ -54,6 +55,8 @@ int main() {
             std::cerr << "map=" << Seconds(mapped - start).count()
                       << " compute=" << Seconds(computed - mapped).count()
                       << " parquet=" << Seconds(end - computed).count() << " seconds rss=" << rss_mib << " MiB\n";
+            const auto ns = [](auto t) { return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count(); };
+            std::cerr << "wall_main=" << ns(wall_main) << " wall_done=" << ns(std::chrono::system_clock::now()) << '\n';
         }
         return 0;
     } catch (const std::exception& error) {
