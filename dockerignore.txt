@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!CMakeLists.txt
+!src
+!src/**
+!scripts
+!scripts/build-container.sh
