@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <string>
 #include <string_view>
+#include <time.h>
 #include <unistd.h>
 
 int main(int, char** argv) {
@@ -33,7 +34,12 @@ int main(int, char** argv) {
     std::string binary(path, size);
     binary += '-';
     binary += variant;
-    if (std::getenv("PROFILE")) std::fprintf(stderr, "isa=%s\n", variant.data());
+    if (std::getenv("PROFILE")) {
+        timespec now{};
+        clock_gettime(CLOCK_REALTIME, &now);
+        std::fprintf(stderr, "isa=%s wall_dispatch=%lld\n", variant.data(),
+                     static_cast<long long>(now.tv_sec) * 1000000000LL + now.tv_nsec);
+    }
     execv(binary.c_str(), argv);
     std::fprintf(stderr, "Cannot start %s: %s\n", binary.c_str(), std::strerror(errno));
     return 1;

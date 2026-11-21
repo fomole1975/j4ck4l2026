@@ -1,0 +1,51 @@
+name: Linux x86 benchmark
+on:
+  workflow_dispatch:
+    inputs:
+      compare_commit:
+        description: Optional 40-character commit to build and time alongside this branch
+        type: string
+        default: ''
+      compiler_study:
+        description: Unused on the diagnostic branch
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      KIT: https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+      WORK: ${{ github.workspace }}/.work
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate practice-size input
+        run: |
+          mkdir -p "$WORK"
+          cd "$WORK"
+          curl -fsSL --retry 3 "$KIT/generator.zip" -o generator.zip
+          unzip -q generator.zip
+          cargo build --offline --release --manifest-path generator/Cargo.toml
+          generator/target/release/generate --seed 32741 --events 20000000 --clicks 5000000 --output practice
+          generator/target/release/generate --seed 817331 --events 60000000 --clicks 15000000 --output final
+      - name: Build scoring image and inspect host CPU
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread'
+          docker build --platform linux/amd64 -t shopping-sessions .
+      - name: Build comparison image
+        if: inputs.compare_commit != ''
+        env:
+          BASE_SHA: ${{ inputs.compare_commit }}
+        run: |
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --depth=1 origin "$BASE_SHA"
+          git worktree add --detach "$WORK/base-source" FETCH_HEAD
+          docker build --platform linux/amd64 -t shopping-baseline "$WORK/base-source"
+      - name: Per-phase timings
+        env:
+          BASE_SHA: ${{ inputs.compare_commit }}
+        run: python3 .github/scripts/diagnose.py
