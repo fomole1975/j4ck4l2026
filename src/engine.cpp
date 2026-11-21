@@ -157,6 +157,11 @@ template <class Value> class KeyTable {
             if (s.key.bits())
                 f(s.value);
     }
+    template <class F> void each(F&& f) const {
+        for (const auto& s : slots_)
+            if (s.key.bits())
+                f(s.key, s.value);
+    }
     void set(Key k, Value v) {
         add(k, [&] { return v; });
     }
@@ -204,6 +209,8 @@ class Aliases {
         groups_.transform([&](uint32_t &i) { i = resolved(i); });
     }
     uint32_t person(Key raw) const { return groups_.get(raw, absent); }
+    // Visits every linked raw ID with its person ordinal (after freeze).
+    template <class F> void each(F&& f) const { groups_.each(f); }
     Key name(uint32_t i) const { return names_[i]; }
     size_t size() const { return names_.size(); }
 };
@@ -466,6 +473,7 @@ struct Local {
     std::vector<TimedEvent> event_extras;
     std::vector<int64_t> wide_click_times;
     Partitions<IndexedRow> indexed;
+    Partitions<Click> click_buckets;
 
     Local(size_t n) : candidates(n), literals(literal_shards), events(n), purchases(n), clicks(n) {}
 
@@ -1335,27 +1343,173 @@ std::optional<uint64_t> recover_event_key(const InputFiles& input, uint64_t limi
     return std::nullopt;
 }
 
+// User IDs are "u" followed by base 36 of the same scramble of person * 512 +
+// alias. The decoded generator person only decides where a person may be
+// finished; every ID still resolves through the links exactly.
+struct UserIndexer {
+    static constexpr uint32_t none = UINT32_MAX;
+    uint64_t key = 0;
+    uint32_t limit = 0;
+    // The literal of a packed "u..." key: its suffix bytes, first in the low byte.
+    static uint64_t literal(Key user) {
+        const uint64_t bits = user.bits();
+        if ((bits >> 56) != 'u')
+            return 0;
+        const uint64_t chars = bits & ((uint64_t{1} << 56) - 1);
+#if defined(__BMI2__)
+        const uint64_t spread = _pdep_u64(chars, UINT64_C(0x7f7f7f7f7f7f7f7f));
+#else
+        uint64_t spread = 0;
+        for (int i = 0; i < 8; ++i)
+            spread |= ((chars >> (7 * i)) & 127) << (8 * i);
+#endif
+        return __builtin_bswap64(spread);
+    }
+    uint32_t person(Key user) const {
+        const uint64_t y = EventIndexer::value(literal(user));
+        if (y == EventIndexer::none)
+            return none;
+        const uint64_t v = ((EventIndexer::unmix(y) ^ key) * EventIndexer::inv_a) & EventIndexer::mask40;
+        return v < (uint64_t{limit} << 9) ? static_cast<uint32_t>(v >> 9) : none;
+    }
+};
+
+std::optional<uint64_t> recover_user_key(const InputFiles& input, uint32_t limit, unsigned workers) {
+    using I = EventIndexer;
+    std::vector<uint64_t> samples;
+    for (size_t c = 0; c < input.events.size() && samples.size() < 64; ++c) {
+        auto text = input.events[c].aligned();
+        for (int line = 0; line < 8 && !text.empty() && samples.size() < 64; ++line) {
+            const auto newline = text.find('\n');
+            const auto row = text.substr(0, newline);
+            text = newline == text.npos ? std::string_view{} : text.substr(newline + 1);
+            const auto comma = row.find(',');
+            if (comma == row.npos)
+                continue;
+            auto id = row.substr(comma + 1);
+            id = id.substr(0, id.find(','));
+            if (id.size() >= 2 && id.front() == '"' && id.back() == '"')
+                id = id.substr(1, id.size() - 2);
+            if (id.size() < 2 || id.size() > 9 || id[0] != 'u')
+                continue;
+            uint64_t literal = 0;
+            std::memcpy(&literal, id.data() + 1, id.size() - 1);
+            if (const auto y = I::value(literal); y != I::none)
+                samples.push_back(I::unmix(y));
+        }
+    }
+    if (samples.size() < 16)
+        return std::nullopt;
+    const uint64_t vlimit = uint64_t{limit} << 9;
+    auto fits = [&](uint64_t key) {
+        size_t good = 0;
+        for (const auto m : samples)
+            good += (((m ^ key) * I::inv_a) & I::mask40) < vlimit;
+        return good * 4 >= samples.size() * 3;
+    };
+    // Most rows use a person's first ID, alias 0, so one of a few samples is
+    // person * 512 for some person below the limit.
+    const uint64_t step = (512 * I::mul_a) & I::mask40;
+    for (size_t attempt = 0; attempt + 1 < samples.size() && attempt < 12; ++attempt) {
+        const uint64_t m0 = samples[attempt], m1 = samples[attempt + 1];
+        std::atomic<uint64_t> found{I::none};
+        const size_t jobs = size_t{workers} * 4, span = (limit + jobs - 1) / jobs;
+        parallel_jobs(workers, jobs, [&](unsigned, size_t job) {
+            uint64_t g = job * span;
+            const uint64_t end = std::min<uint64_t>(limit, g + span);
+            uint64_t product = (g * step) & I::mask40;
+            for (; g < end; ++g, product = (product + step) & I::mask40) {
+                const uint64_t key = m0 ^ product;
+                if ((((m1 ^ key) * I::inv_a) & I::mask40) < vlimit && fits(key)) {
+                    found.store(key, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        });
+        if (found.load() != I::none)
+            return found.load();
+    }
+    return std::nullopt;
+}
+
 using CompactSpan = UserBlocks<true>::Span;
+constexpr uint32_t home_none = UINT32_MAX, home_split = UINT32_MAX - 1;
+constexpr uint32_t multi_person = UINT32_MAX - 1;
+
+// Each generator person is finished inside the one index range holding all of
+// its events; any appearance in a second range (a boundary, a foreign copy or
+// a general-path event) marks it split.
+inline void mark_home(std::atomic<uint32_t>& home, uint32_t p) {
+    uint32_t current = home.load(std::memory_order_relaxed);
+    while (current != p && current != home_split) {
+        const uint32_t want = current == home_none ? p : home_split;
+        if (home.compare_exchange_weak(current, want, std::memory_order_relaxed))
+            break;
+    }
+}
+
 struct IndexScratch {
     struct Entry {
         uint64_t bits = 0;
-        uint32_t person = absent;
+        uint32_t person = absent, generator = UserIndexer::none;
     };
     struct Placed {
         uint64_t user;
         uint32_t offset, amount;
     };
-    std::vector<uint32_t> ingest, pending;
+    struct Item {
+        uint64_t label;
+        uint32_t kind, ref;
+    };
+    std::vector<uint32_t> ingest, events;
+    std::vector<uint64_t> purchases, event_scratch;
     std::vector<Placed> placed;
+    std::vector<Item> items;
+    std::vector<ShortClick> clicks, click_scratch;
     std::array<Entry, 1024> cache{};
+};
+
+struct IndexRun {
+    uint64_t label;
+    uint32_t start, count, generator, linked;
+};
+struct IndexedPartition {
+    std::unique_ptr<uint32_t[]> out;
+    std::vector<IndexRun> runs;
+    std::vector<ShortClick> clicks;
+};
+
+struct PersonResolver {
+    const Aliases& aliases;
+    const std::vector<uint32_t>& person_generator;
+    const UserIndexer& users;
+    // A raw ID's person, and the generator person all of its IDs share.
+    const IndexScratch::Entry& operator()(IndexScratch& scratch, uint64_t user) const {
+        auto& entry = scratch.cache[(user * UINT64_C(0x9e3779b97f4a7c15)) >> 54];
+        if (entry.bits != user) {
+            const Key key = Key::from_packed_ascii(user);
+            entry.bits = user;
+            entry.person = aliases.person(key);
+            if (entry.person != absent) {
+                const uint32_t g = person_generator[entry.person];
+                entry.generator = g == multi_person ? UserIndexer::none : g;
+            } else {
+                entry.generator = users.person(key);
+            }
+        }
+        return entry;
+    }
+    void prefetch(IndexScratch& scratch, uint64_t user) const {
+        if (user && scratch.cache[(user * UINT64_C(0x9e3779b97f4a7c15)) >> 54].bits != user)
+            aliases.prefetch(Key::from_packed_ascii(user));
+    }
 };
 
 // Place one index range's rows by slot. The earliest ingestion wins each slot.
 // Walking slots in order then yields every generator person's events already
-// time-ordered; consecutive events of one person become one span.
-std::unique_ptr<uint32_t[]> index_partition(std::vector<Local>& locals, size_t p, unsigned bits,
-                                            const Aliases& aliases, size_t mask, IndexScratch& scratch,
-                                            Partitions<CompactSpan>& linked, Partitions<CompactSpan>& singles) {
+// time-ordered; consecutive events of one person become one run.
+void place_partition(std::vector<Local>& locals, size_t p, unsigned bits, const PersonResolver& resolve,
+                     std::atomic<uint32_t>* homes, IndexScratch& scratch, IndexedPartition& part) {
     constexpr uint32_t empty = UINT32_MAX;
     const size_t range = size_t{1} << bits;
     auto& ingest = scratch.ingest;
@@ -1378,70 +1532,246 @@ std::unique_ptr<uint32_t[]> index_partition(std::vector<Local>& locals, size_t p
         std::vector<IndexedRow>().swap(local.indexed[p]);
     }
     if (!n)
-        return nullptr;
-    std::unique_ptr<uint32_t[]> out(new uint32_t[2 * n + 2 * purchases + 1]);
-    using Label = UserBlocks<true>::Label;
-    uint32_t cursor = 0, run_start = 0;
-    bool active = false, run_linked = false;
-    uint64_t run_label = 0;
-    auto& pending = scratch.pending;
+        return;
+    part.out.reset(new uint32_t[2 * n + 2 * purchases + 1]);
+    uint32_t* out = part.out.get();
+    uint32_t cursor = 0;
+    bool active = false;
+    IndexRun run{};
+    auto& pending = scratch.purchases;
     pending.clear();
     auto close = [&] {
-        const uint32_t count = cursor - run_start;
-        out[cursor++] = static_cast<uint32_t>(pending.size() / 2);
-        for (const auto x : pending)
-            out[cursor++] = x;
-        pending.clear();
-        if (run_linked) {
-            linked[run_label & mask].push_back(
-                {Label(static_cast<uint32_t>(run_label)), out.get() + run_start, nullptr, count, 0});
-        } else {
-            const Key user = Key::from_packed_ascii(run_label);
-            singles[user.hash() & mask].push_back({Label(user), out.get() + run_start, nullptr, count, 0});
+        run.count = cursor - run.start;
+        out[cursor++] = static_cast<uint32_t>(pending.size());
+        for (const auto x : pending) {
+            out[cursor++] = static_cast<uint32_t>(x >> 32);
+            out[cursor++] = static_cast<uint32_t>(x);
         }
-    };
-    auto cache_slot = [&](uint64_t user) -> IndexScratch::Entry& {
-        return scratch.cache[(user * UINT64_C(0x9e3779b97f4a7c15)) >> 54];
+        pending.clear();
+        if (run.generator != UserIndexer::none)
+            mark_home(homes[run.generator], static_cast<uint32_t>(p));
+        part.runs.push_back(run);
     };
     constexpr size_t ahead = 64;
     for (size_t s = 0; s < range; ++s) {
-        // Warm the alias table for a user that the cache cannot answer.
-        if (s + ahead < range && ingest[s + ahead] != empty) {
-            const uint64_t future = placed[s + ahead].user;
-            if (future && cache_slot(future).bits != future)
-                aliases.prefetch(Key::from_packed_ascii(future));
-        }
+        if (s + ahead < range && ingest[s + ahead] != empty)
+            resolve.prefetch(scratch, placed[s + ahead].user);
         if (ingest[s] == empty)
             continue;
         ingest[s] = empty;
         const auto& row = placed[s];
-        const uint64_t user = row.user;
-        if (!user)
+        if (!row.user)
             continue;
-        auto& entry = cache_slot(user);
-        if (entry.bits != user) {
-            entry.bits = user;
-            entry.person = aliases.person(Key::from_packed_ascii(user));
-        }
-        const bool is_linked = entry.person != absent;
-        const uint64_t label = is_linked ? entry.person : user;
-        if (!active || is_linked != run_linked || label != run_label) {
+        const auto& entry = resolve(scratch, row.user);
+        const uint32_t linked = entry.person != absent;
+        const uint64_t label = linked ? entry.person : row.user;
+        if (!active || linked != run.linked || label != run.label) {
             if (active)
                 close();
             active = true;
-            run_linked = is_linked;
-            run_label = label;
-            run_start = cursor;
+            run = {label, cursor, 0, entry.generator, linked};
         }
         out[cursor++] = row.offset;
-        if (row.amount) {
-            pending.push_back(row.offset);
-            pending.push_back(row.amount);
-        }
+        if (row.amount)
+            pending.push_back((uint64_t{row.offset} << 32) | row.amount);
     }
     if (active)
         close();
-    return out;
+}
+
+// Finish every person whose events and clicks all belong to this range. The
+// rest travel as spans to the general person shards.
+void finalize_partition(std::vector<Local>& locals, size_t p, const PersonResolver& resolve,
+                        const std::atomic<uint32_t>* homes, IndexScratch& scratch, IndexedPartition& part,
+                        size_t mask, Partitions<CompactSpan>& linked_out, Partitions<CompactSpan>& singles_out,
+                        SessionState& state, CampaignTotals& totals, std::vector<UserDaily>& users, int64_t start) {
+    using Label = UserBlocks<true>::Label;
+    using Item = IndexScratch::Item;
+    const uint32_t here = static_cast<uint32_t>(p);
+    auto is_home = [&](uint32_t g) {
+        return g != UserIndexer::none && homes[g].load(std::memory_order_relaxed) == here;
+    };
+    // Local runs arrive in generator order. Their range bounds the local clicks.
+    uint32_t g_min = UINT32_MAX, g_max = 0;
+    size_t bucket_clicks = 0;
+    for (const auto& r : part.runs)
+        if (is_home(r.generator)) {
+            g_min = std::min(g_min, r.generator);
+            g_max = std::max(g_max, r.generator);
+        }
+    for (const auto& local : locals)
+        bucket_clicks += local.click_buckets[p].size();
+    // Deferred clicks are stored once, then regrouped contiguously per person.
+    part.clicks.reserve(2 * bucket_clicks);
+    // Counting sort of local clicks by generator; other clicks are deferred.
+    auto& items = scratch.items;
+    items.clear();
+    auto& counts = scratch.events;
+    const size_t span_g = g_min <= g_max ? size_t{g_max - g_min} + 1 : 0;
+    counts.assign(span_g + 1, 0);
+    auto& local_clicks = scratch.clicks;
+    auto& generators = scratch.purchases;
+    generators.clear();
+    for (const auto& local : locals) {
+        for (const auto& c : local.click_buckets[p]) {
+            const auto& entry = resolve(scratch, c.user.bits());
+            const uint64_t label = entry.person != absent ? entry.person : c.user.bits();
+            const uint32_t linked = entry.person != absent;
+            if (is_home(entry.generator) && entry.generator >= g_min && entry.generator <= g_max) {
+                ++counts[entry.generator - g_min + 1];
+                generators.push_back((uint64_t{entry.generator - g_min} << 33) | (uint64_t{linked} << 32) |
+                                     static_cast<uint32_t>(items.size()));
+            } else {
+                generators.push_back(UINT64_MAX);
+            }
+            items.push_back({label, linked, 0});
+        }
+    }
+    for (size_t i = 1; i < counts.size(); ++i)
+        counts[i] += counts[i - 1];
+    local_clicks.resize(counts.empty() ? 0 : counts.back());
+    std::vector<Item> deferred;
+    {
+        size_t k = 0;
+        for (const auto& local : locals) {
+            for (const auto& c : local.click_buckets[p]) {
+                const uint64_t code = generators[k];
+                if (code != UINT64_MAX) {
+                    const auto slot = counts[code >> 33]++;
+                    local_clicks[slot] = {c.time, c.campaign, c.id};
+                    items[k].ref = static_cast<uint32_t>(slot);
+                } else {
+                    // Keep the click itself for its span.
+                    items[k].ref = static_cast<uint32_t>(part.clicks.size());
+                    part.clicks.push_back({c.time, c.campaign, c.id});
+                    deferred.push_back(items[k]);
+                }
+                ++k;
+            }
+        }
+    }
+    // After the prefix pass, counts[g] is the end of generator g's clicks.
+    // Recover each local click's label from items in click-slot order.
+    std::vector<std::pair<uint64_t, uint32_t>> slot_labels(local_clicks.size());
+    for (const auto& item : items)
+        if (generators[&item - items.data()] != UINT64_MAX)
+            slot_labels[item.ref] = {item.label, item.kind};
+    for (auto& local : locals)
+        std::vector<Click>().swap(local.click_buckets[p]);
+
+    auto emit_span = [&](bool linked, uint64_t label, const uint32_t* events, uint32_t ne, ShortClick* clicks,
+                         uint32_t nc) {
+        const Label tag = linked ? Label(static_cast<uint32_t>(label)) : Label(Key::from_packed_ascii(label));
+        auto& out = linked ? linked_out[label & mask] : singles_out[Key::from_packed_ascii(label).hash() & mask];
+        out.push_back({tag, const_cast<uint32_t*>(events), clicks, ne, nc});
+    };
+    auto& purchases = scratch.event_scratch;
+    std::vector<uint32_t> merged;
+    std::vector<ShortClick> person_clicks;
+    auto finish = [&](bool linked, uint64_t label, const IndexRun* const* runs, size_t nruns,
+                      const ShortClick* clicks, size_t nc) {
+        size_t ne = 0;
+        for (size_t i = 0; i < nruns; ++i)
+            ne += runs[i]->count;
+        if (!ne)
+            return;
+        purchases.clear();
+        const uint32_t* events;
+        auto gather = [&](const IndexRun& r) {
+            const uint32_t* side = part.out.get() + r.start + r.count;
+            for (uint32_t j = 0, count = *side++; j < count; ++j, side += 2)
+                purchases.push_back((uint64_t{side[0]} << 32) | side[1]);
+        };
+        if (nruns == 1) {
+            events = part.out.get() + runs[0]->start;
+            gather(*runs[0]);
+        } else {
+            merged.clear();
+            for (size_t i = 0; i < nruns; ++i) {
+                const uint32_t* rows = part.out.get() + runs[i]->start;
+                merged.insert(merged.end(), rows, rows + runs[i]->count);
+                gather(*runs[i]);
+            }
+            std::sort(merged.begin(), merged.end());
+            std::sort(purchases.begin(), purchases.end());
+            events = merged.data();
+        }
+        person_clicks.assign(clicks, clicks + nc);
+        if (nc > 2)
+            sort_compact_clicks(person_clicks.data(), nc, scratch.click_scratch);
+        const Key name = linked ? resolve.aliases.name(static_cast<uint32_t>(label)) : Key::from_packed_ascii(label);
+        state.person(name, events, ne, person_clicks.data(), nc, totals, users, start, nullptr, purchases);
+    };
+
+    // Group local runs by generator (another person's run may sit between
+    // two runs of one generator person), keeping slot order within each.
+    std::vector<uint32_t> run_ends(span_g + 1, 0);
+    for (const auto& run : part.runs)
+        if (is_home(run.generator))
+            ++run_ends[run.generator - g_min + 1];
+    for (size_t i = 1; i < run_ends.size(); ++i)
+        run_ends[i] += run_ends[i - 1];
+    std::vector<const IndexRun*> ordered(run_ends.empty() ? 0 : run_ends.back());
+    for (const auto& run : part.runs) {
+        if (is_home(run.generator))
+            ordered[run_ends[run.generator - g_min]++] = &run;
+        else
+            emit_span(run.linked, run.label, part.out.get() + run.start, run.count, nullptr, 0);
+    }
+    // Walk generators in order: their local runs, then their clicks.
+    std::vector<const IndexRun*> group_runs;
+    std::vector<std::pair<uint64_t, uint32_t>> labels;
+    std::vector<ShortClick> mine;
+    for (size_t g = 0; g < span_g; ++g) {
+        const size_t r = g ? run_ends[g - 1] : 0, r_end = run_ends[g];
+        const size_t c_begin = g ? counts[g - 1] : 0, c_end = counts[g];
+        if (r == r_end)
+            continue;  // Clicks of a generator person without local events.
+        const auto& run = *ordered[r];
+        bool single = true;
+        for (size_t i = r + 1; i < r_end && single; ++i)
+            single = ordered[i]->label == run.label && ordered[i]->linked == run.linked;
+        for (size_t i = c_begin; i < c_end && single; ++i)
+            single = slot_labels[i].first == run.label && slot_labels[i].second == run.linked;
+        if (single) {
+            finish(run.linked, run.label, ordered.data() + r, r_end - r, local_clicks.data() + c_begin,
+                   c_end - c_begin);
+            continue;
+        }
+        // Several people share this generator person (a split link set).
+        labels.clear();
+        for (size_t i = r; i < r_end; ++i)
+            labels.push_back({ordered[i]->label, ordered[i]->linked});
+        std::sort(labels.begin(), labels.end());
+        labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
+        for (const auto& [label, linked] : labels) {
+            group_runs.clear();
+            for (size_t i = r; i < r_end; ++i)
+                if (ordered[i]->label == label && ordered[i]->linked == linked)
+                    group_runs.push_back(ordered[i]);
+            mine.clear();
+            for (size_t i = c_begin; i < c_end; ++i)
+                if (slot_labels[i].first == label && slot_labels[i].second == linked)
+                    mine.push_back(local_clicks[i]);
+            finish(linked, label, group_runs.data(), group_runs.size(), mine.data(), mine.size());
+        }
+    }
+    // Clicks of people finished elsewhere travel as one span per person.
+    std::sort(deferred.begin(), deferred.end(), [](const Item& a, const Item& b) {
+        return a.label != b.label ? a.label < b.label : a.kind < b.kind;
+    });
+    for (size_t i = 0; i < deferred.size();) {
+        size_t j = i + 1;
+        while (j < deferred.size() && deferred[j].label == deferred[i].label && deferred[j].kind == deferred[i].kind)
+            ++j;
+        // Spans need contiguous clicks; regroup this person's deferred clicks.
+        const size_t first = part.clicks.size();
+        for (size_t k = i; k < j; ++k)
+            part.clicks.push_back(part.clicks[deferred[k].ref]);
+        emit_span(deferred[i].kind & 1, deferred[i].label, nullptr, 0, part.clicks.data() + first,
+                  static_cast<uint32_t>(j - i));
+        i = j;
+    }
 }
 
 template <bool Compact>
@@ -1650,6 +1980,7 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
     bool indexed = allow_index && compact_window && dim.categories.size() <= uint32_t{UINT8_MAX} + 1 &&
                    !(index_setting && std::string_view(index_setting) == "off");
     EventIndexer indexer;
+    UserIndexer users_index;
     size_t partitions = 0;
     if (indexed) {
         // Typical rows exceed 60 bytes, so this overestimates the ID range.
@@ -1657,10 +1988,15 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
         indexer.bits = std::clamp<unsigned>(std::bit_width(expected >> 10), 10, 16);
         partitions = (expected >> indexer.bits) + 1;
         indexer.limit = uint64_t{partitions} << indexer.bits;
-        if (const auto key = recover_event_key(input, indexer.limit, workers))
+        users_index.limit = static_cast<uint32_t>(std::min<uint64_t>(expected / 24 + 4096, uint64_t{1} << 30));
+        const auto key = recover_event_key(input, indexer.limit, workers);
+        const auto user_key = key ? recover_user_key(input, users_index.limit, workers) : std::nullopt;
+        if (key && user_key) {
             indexer.key = *key;
-        else
+            users_index.key = *user_key;
+        } else {
             indexed = false;
+        }
     }
     if (!indexed)
         partitions = 0;
@@ -1668,10 +2004,13 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
         const size_t per_worker = (size_t{1} << indexer.bits) / workers;
         for (auto& local : locals) {
             local.indexed.resize(partitions);
+            local.click_buckets.resize(partitions);
             for (auto& rows : local.indexed)
                 rows.reserve(per_worker + per_worker / 8 + 16);
         }
     }
+    std::unique_ptr<std::atomic<uint32_t>[]> homes(indexed ? new std::atomic<uint32_t>[users_index.limit] : nullptr);
+    std::vector<uint32_t> person_generator;
     mark("index");
     std::atomic<bool> index_failed{false};
     const uint64_t slot_mask = (uint64_t{1} << indexer.bits) - 1;
@@ -1702,6 +2041,21 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
     parallel_jobs(workers, input.events.size() + 1, [&](unsigned worker, size_t task) {
         if (!task) {
             aliases.emplace(identities(input));
+            if (indexed) {
+                for (uint32_t g = 0; g < users_index.limit; ++g)
+                    homes[g].store(home_none, std::memory_order_relaxed);
+                // A person is finishable in one range only if all its IDs
+                // decode to one generator person.
+                person_generator.assign(aliases->size(), home_none);
+                aliases->each([&](Key raw, uint32_t person) {
+                    const uint32_t g = users_index.person(raw);
+                    auto& shared = person_generator[person];
+                    if (g == UserIndexer::none || (shared != home_none && shared != g))
+                        shared = multi_person;
+                    else if (shared == home_none)
+                        shared = g;
+                });
+            }
             return;
         }
         auto& local = locals[worker];
@@ -1754,6 +2108,24 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
     mark("events+links");
     if (index_failed.load())
         return std::nullopt;
+    std::vector<IndexedPartition> index_parts(partitions);
+    std::vector<IndexScratch> index_scratch(indexed ? workers : 0);
+    const PersonResolver resolve{*aliases, person_generator, users_index};
+    if (indexed) {
+        parallel_jobs(workers, partitions + nshards, [&](unsigned worker, size_t task) {
+            if (task < partitions) {
+                place_partition(locals, task, indexer.bits, resolve, homes.get(), index_scratch[worker],
+                                index_parts[task]);
+                return;
+            }
+            // General-path events cannot be finished inside an index range.
+            for (const auto& local : locals)
+                for (const auto& e : local.events[task - partitions])
+                    if (const uint32_t g = users_index.person(e.user()); g != UserIndexer::none)
+                        homes[g].store(home_split, std::memory_order_relaxed);
+        });
+    }
+    mark("place");
     const int64_t click_start = input.window.start - week_ms;
     const bool compact_clicks = input.window.end - input.window.start <= int64_t{UINT32_MAX} - week_ms;
     // Estimate records from uniformly spaced physical chunks. This keeps
@@ -1779,27 +2151,26 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
             for (auto &rows : local.clicks)
                 rows.reserve(capacity);
     }
-    std::vector<Partitions<CompactSpan>> index_linked, index_singles;
-    std::vector<std::unique_ptr<uint32_t[]>> index_blocks(partitions);
-    std::vector<IndexScratch> index_scratch(indexed ? workers : 0);
-    if (indexed) {
-        index_linked.assign(workers, Partitions<CompactSpan>(nshards));
-        index_singles.assign(workers, Partitions<CompactSpan>(nshards));
-    }
-    const size_t index_first = input.clicks.size() + literal_shards + nshards;
-    parallel_jobs(workers, index_first + partitions, [&](unsigned worker, size_t task) {
-        if (task >= index_first) {
-            const size_t p = task - index_first;
-            index_blocks[p] = index_partition(locals, p, indexer.bits, *aliases, mask, index_scratch[worker],
-                                              index_linked[worker], index_singles[worker]);
-        } else if (task < input.clicks.size()) {
+    // A click whose generator person lives in one index range joins it there.
+    auto route_click = [&](Local& local, Key user) -> std::vector<Click>& {
+        if (indexed) {
+            if (const uint32_t g = users_index.person(user); g != UserIndexer::none) {
+                const uint32_t home = homes[g].load(std::memory_order_relaxed);
+                if (home < partitions)
+                    return local.click_buckets[home];
+            }
+        }
+        return local.clicks[user.hash() & mask];
+    };
+    parallel_jobs(workers, input.clicks.size() + literal_shards + nshards, [&](unsigned worker, size_t task) {
+        if (task < input.clicks.size()) {
             auto& local = locals[worker];
             auto general = [&](const ClickInput &c) {
                 const auto campaign = dim.campaign_index.get(c.campaign, absent);
                 if (campaign == absent) return;
                 Key user(c.user);
                 const uint32_t time = local.store_click_time(c.ts, click_start, compact_clicks);
-                local.clicks[user.hash() & mask].push_back({user, Key(c.id), time, campaign});
+                route_click(local, user).push_back({user, Key(c.id), time, campaign});
             };
             auto indexed = [&](uint64_t click_bits, uint64_t user_bits, uint32_t slot, int64_t ts) {
                 const auto campaign = dim.campaign_index.known_slot(slot);
@@ -1807,8 +2178,7 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
                 if (*campaign != absent) {
                     auto user = Key::from_packed_ascii(user_bits);
                     const uint32_t time = local.store_click_time(ts, click_start, compact_clicks);
-                    local.clicks[user.hash() & mask].push_back(
-                        {user, Key::from_packed_ascii(click_bits), time, *campaign});
+                    route_click(local, user).push_back({user, Key::from_packed_ascii(click_bits), time, *campaign});
                 }
                 return true;
             };
@@ -1822,13 +2192,24 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
     });
     mark("clicks+dedup");
     Result result;
-    result.users.resize(nshards);
+    result.users.resize(nshards + partitions);
     std::vector<CampaignTotals> totals;
     std::vector<SessionState> states;
     for (unsigned i = 0; i < workers; ++i) {
         totals.emplace_back(input.window, dim.campaigns.size());
         states.emplace_back(dim);
     }
+    std::vector<Partitions<CompactSpan>> index_linked, index_singles;
+    if (indexed) {
+        index_linked.assign(workers, Partitions<CompactSpan>(nshards));
+        index_singles.assign(workers, Partitions<CompactSpan>(nshards));
+        parallel_jobs(workers, partitions, [&](unsigned worker, size_t p) {
+            finalize_partition(locals, p, resolve, homes.get(), index_scratch[worker], index_parts[p], mask,
+                               index_linked[worker], index_singles[worker], states[worker], totals[worker],
+                               result.users[nshards + p], input.window.start);
+        });
+    }
+    mark("finalize");
     const bool compact = compact_clicks && dim.categories.size() <= uint32_t{UINT8_MAX} + 1;
     if (compact && indexed)
         sessionize<true>(locals, *aliases, input.window.start, workers, nshards, states, totals, result,
