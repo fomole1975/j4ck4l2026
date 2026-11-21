@@ -1332,6 +1332,9 @@ void sessionize(std::vector<Local>& locals, const Aliases& aliases, int64_t star
         for (const auto& writer : destinations)
             for (const auto& span : writer[shard])
                 linked[offsets[span.label.person >> shard_bits]++] = span;
+        // Each person usually spans one or two output days. Reserving avoids
+        // repeatedly copying this shard's rows while they are appended.
+        result.users[shard].reserve(2 * (linked.size() + sources[shard].singles.size()) + 16);
         process_histories.template operator()<false>(linked, worker, shard);
         process_histories.template operator()<true>(sources[shard].singles, worker, shard);
     });
