@@ -47,10 +47,6 @@ struct InputFiles::Mapping {
                 close(fd);
                 throw std::system_error(ec, std::generic_category(), path.string());
             }
-            madvise(mapped, size, MADV_SEQUENTIAL | MADV_WILLNEED);
-#ifdef MADV_HUGEPAGE
-            madvise(mapped, size, MADV_HUGEPAGE);
-#endif
             data = static_cast<const char*>(mapped);
         }
         close(fd);

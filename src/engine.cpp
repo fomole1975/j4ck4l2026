@@ -651,11 +651,9 @@ struct BucketSummary {
     static constexpr uint32_t none = UINT32_MAX;
     static constexpr size_t bins = UINT32_MAX / uint32_t(session_gap) + 1;
     struct Bucket {
-        uint32_t minimum, maximum;
+        uint32_t minimum, maximum, count, session;
     };
     std::array<Bucket, bins> b{};
-    std::array<uint32_t, bins> counts{};
-    std::array<uint16_t, bins> bin_session{};
     std::array<uint64_t, (bins + 63) / 64> occupied{};
     std::vector<SummaryPurchase> purchases;
     std::vector<SummarySession> sessions;
@@ -668,17 +666,13 @@ struct BucketSummary {
         for (size_t i = 0; i < n; ++i) {
             const auto ts = rows[i];
             const uint32_t k = ts / uint32_t(session_gap);
-            const uint64_t bit = uint64_t{1} << (k & 63);
-            auto& word = occupied[k >> 6];
             auto& slot = b[k];
-            if (word & bit) {
-                if (ts < slot.minimum) slot.minimum = ts;
-                if (ts > slot.maximum) slot.maximum = ts;
-                ++counts[k];
+            if (slot.count++) {
+                slot.minimum = std::min(slot.minimum, ts);
+                slot.maximum = std::max(slot.maximum, ts);
             } else {
-                word |= bit;
+                occupied[k / 64] |= uint64_t{1} << (k % 64);
                 slot.minimum = slot.maximum = ts;
-                counts[k] = 1;
             }
         }
         const auto* side = rows + n;
@@ -696,16 +690,17 @@ struct BucketSummary {
             while (mask) {
                 uint32_t k = 64 * i + std::countr_zero(mask);
                 mask &= mask - 1;
-                const auto slot = b[k];
+                auto& slot = b[k];
                 if (int64_t(slot.minimum) - previous > session_gap)
                     sessions.push_back({base + slot.minimum, 0, none});
-                bin_session[k] = static_cast<uint16_t>(sessions.size() - 1);
-                sessions.back().count += counts[k];
+                slot.session = sessions.size() - 1;
+                sessions.back().count += slot.count;
                 previous = slot.maximum;
+                slot.count = 0;
             }
         }
         for (uint32_t j = 0; j < purchases.size(); ++j) {
-            auto& session = sessions[bin_session[purchases[j].at]];
+            auto& session = sessions[b[purchases[j].at].session];
             purchases[j].at = session.first_purchase;
             session.first_purchase = j;
         }
@@ -1380,6 +1375,45 @@ Result run_engine(const InputFiles& input, unsigned workers) {
         for (auto& rows : local.events)
             rows.reserve(estimate);
     }
+    parallel_jobs(workers, input.events.size() + 1, [&](unsigned worker, size_t task) {
+        if (!task) {
+            aliases.emplace(identities(input));
+            return;
+        }
+        auto& local = locals[worker];
+        auto general = [&](const EventInput &e) {
+            uint64_t location = EventLocations::invalid;
+            if (e.valid) {
+                Key user = e.packed_user ? Key::from_packed_ascii(e.packed_user) : Key(e.user);
+                const size_t shard = user.hash() & mask;
+                auto& rows = local.events[shard];
+                location = addresses.encode(worker, shard, rows.size());
+                const auto category = e.price ? dim.product_category.get(e.product, 0) : 0;
+                local.append_event(shard, user, local.pack(input.window.start, e.ts, {e.price, category}));
+            }
+            // Even an invalid payload can be the earliest well-formed copy.
+            if (const uint64_t literal = e.literal_id ? e.literal_id : event_literal(e.id)) {
+                add_literal(local, literal, e.ingest, location);
+            } else {
+                Key id(e.id);
+                local.candidates[id.hash() & mask].push_back({id, e.ingest, location});
+            }
+        };
+        auto basic = [&](uint64_t user_bits, uint64_t literal, int64_t time, int64_t ingest) {
+            uint64_t location = EventLocations::invalid;
+            if (user_bits) {
+                const auto user = Key::from_packed_ascii(user_bits);
+                const auto shard = user.hash() & mask;
+                auto &rows = local.events[shard];
+                location = addresses.encode(worker, shard, rows.size());
+                local.append_event(shard, user, local.pack(input.window.start, time, {0, 0}));
+            }
+            add_literal(local, literal, ingest, location);
+        };
+        EventSink sink{general, basic};
+        for_events(input.events[task - 1], input.window, sink);
+    });
+    mark("events+links");
     const int64_t click_start = input.window.start - week_ms;
     const bool compact_clicks = input.window.end - input.window.start <= int64_t{UINT32_MAX} - week_ms;
     // Estimate records from uniformly spaced physical chunks. This keeps
@@ -1405,49 +1439,9 @@ Result run_engine(const InputFiles& input, unsigned workers) {
             for (auto &rows : local.clicks)
                 rows.reserve(capacity);
     }
-    const size_t event_tasks = input.events.size();
-    parallel_jobs(workers, 1 + event_tasks + input.clicks.size(), [&](unsigned worker, size_t task) {
-        if (!task) {
-            aliases.emplace(identities(input));
-            return;
-        }
-        auto& local = locals[worker];
-        if (task <= event_tasks) {
-            auto general = [&](const EventInput &e) {
-                uint64_t location = EventLocations::invalid;
-                if (e.valid) {
-                    Key user = e.packed_user ? Key::from_packed_ascii(e.packed_user) : Key(e.user);
-                    const size_t shard = user.hash() & mask;
-                    __builtin_prefetch(&local.events[shard], 1, 1);
-                    auto& rows = local.events[shard];
-                    location = addresses.encode(worker, shard, rows.size());
-                    const auto category = e.price ? dim.product_category.get(e.product, 0) : 0;
-                    local.append_event(shard, user, local.pack(input.window.start, e.ts, {e.price, category}));
-                }
-                // Even an invalid payload can be the earliest well-formed copy.
-                if (const uint64_t literal = e.literal_id ? e.literal_id : event_literal(e.id)) {
-                    add_literal(local, literal, e.ingest, location);
-                } else {
-                    Key id(e.id);
-                    local.candidates[id.hash() & mask].push_back({id, e.ingest, location});
-                }
-            };
-            auto basic = [&](uint64_t user_bits, uint64_t literal, int64_t time, int64_t ingest) {
-                uint64_t location = EventLocations::invalid;
-                if (user_bits) {
-                    const auto user = Key::from_packed_ascii(user_bits);
-                    const auto shard = user.hash() & mask;
-                    __builtin_prefetch(&local.events[shard], 1, 1);
-                    auto &rows = local.events[shard];
-                    location = addresses.encode(worker, shard, rows.size());
-                    local.append_event(shard, user, local.pack(input.window.start, time, {0, 0}));
-                }
-                add_literal(local, literal, ingest, location);
-            };
-            EventSink sink{general, basic};
-            for_events(input.events[task - 1], input.window, sink);
-        } else {
-            const size_t click_idx = task - 1 - event_tasks;
+    parallel_jobs(workers, input.clicks.size() + literal_shards + nshards, [&](unsigned worker, size_t task) {
+        if (task < input.clicks.size()) {
+            auto& local = locals[worker];
             auto general = [&](const ClickInput &c) {
                 const auto campaign = dim.campaign_index.get(c.campaign, absent);
                 if (campaign == absent) return;
@@ -1467,19 +1461,14 @@ Result run_engine(const InputFiles& input, unsigned workers) {
                 return true;
             };
             ClickSink sink{general, indexed};
-            for_clicks(input.clicks[click_idx], input.window, sink);
-        }
-    });
-    mark("parse+links");
-    parallel_jobs(workers, literal_shards + nshards, [&](unsigned worker, size_t task) {
-        (void)worker;
-        if (task < literal_shards) {
-            deduplicate_literals(locals, task, addresses);
+            for_clicks(input.clicks[task], input.window, sink);
+        } else if (task < input.clicks.size() + literal_shards) {
+            deduplicate_literals(locals, task - input.clicks.size(), addresses);
         } else {
-            exclude_duplicate_rows(locals, task - literal_shards, addresses);
+            exclude_duplicate_rows(locals, task - input.clicks.size() - literal_shards, addresses);
         }
     });
-    mark("dedup");
+    mark("clicks+dedup");
     Result result;
     result.users.resize(nshards);
     std::vector<CampaignTotals> totals;
