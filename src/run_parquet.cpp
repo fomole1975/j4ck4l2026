@@ -3,17 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <bit>
-#include <cerrno>
 #include <cstdint>
 #include <cstring>
-#include <fcntl.h>
+#include <fstream>
 #include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
-#include <unistd.h>
 #include <vector>
 
 namespace shopping {
@@ -121,28 +118,29 @@ template <size_t N> class ParquetPart {
         std::array<Chunk, N> columns;
     };
     const std::array<Column, N> &schema;
-    std::filesystem::path path_;
-    Bytes file_buf;
-    uint64_t rows = 0;
+    std::ofstream file;
+    uint64_t offset = 0, rows = 0;
     std::vector<Group> groups;
     void write(std::string_view bytes) {
-        file_buf.append(bytes);
+        file.write(bytes.data(), bytes.size());
+        offset += bytes.size();
     }
 
   public:
     ParquetPart(const std::filesystem::path &path, const std::array<Column, N> &schema)
-        : schema(schema), path_(path) {
-        file_buf.reserve(4 * 1024 * 1024);
+        : schema(schema), file(path, std::ios::binary) {
+        file.exceptions(std::ios::badbit | std::ios::failbit);
         write("PAR1");
     }
     void group(size_t n, const std::array<Bytes, N> &values, std::string_view definition_levels = {},
                const std::array<Dictionary, N> *dictionaries = nullptr) {
         Group group_info{n, {}};
         for (size_t i = 0; i < N; ++i) {
-            const uint64_t chunk_begin = file_buf.size();
+            const uint64_t chunk_begin = offset;
             const auto *dict = dictionaries ? &(*dictionaries)[i] : nullptr;
             bool has_dictionary = dict && dict->entries;
             if (has_dictionary) {
+
                 Bytes header;
                 CompactProtocol page{header};
                 page.integer(1, CompactProtocol::I32, dictionary_page);
@@ -174,8 +172,7 @@ template <size_t N> class ParquetPart {
             data.integer(4, CompactProtocol::I32, rle);
             data.close();
             page.close();
-            const uint64_t data_off = file_buf.size();
-            group_info.columns[i] = {chunk_begin, data_off, data_off - chunk_begin + buffer.size() + payload,
+            group_info.columns[i] = {chunk_begin, offset, offset - chunk_begin + buffer.size() + payload,
                                      has_dictionary};
             write(buffer);
             if (!levels.empty())
@@ -248,25 +245,7 @@ template <size_t N> class ParquetPart {
         append(buffer, footer);
         buffer.append("PAR1");
         write(buffer);
-
-        int fd = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0)
-            throw std::system_error(errno, std::generic_category(), path_.string());
-        const char *ptr = file_buf.data();
-        size_t rem = file_buf.size();
-        while (rem > 0) {
-            ssize_t written = ::write(fd, ptr, rem);
-            if (written < 0) {
-                if (errno == EINTR) continue;
-                int ec = errno;
-                ::close(fd);
-                throw std::system_error(ec, std::generic_category(), path_.string());
-            }
-            ptr += written;
-            rem -= static_cast<size_t>(written);
-        }
-        if (::close(fd) != 0)
-            throw std::system_error(errno, std::generic_category(), path_.string());
+        file.close();
     }
 };
 

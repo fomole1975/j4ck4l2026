@@ -47,7 +47,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_
     install(TARGETS shopping-sessions RUNTIME DESTINATION bin COMPONENT shopping-sessions)
     foreach(variant IN ITEMS generic avx2 avx512 vbmi2)
         add_pipeline(shopping-sessions-${variant})
-        target_compile_options(shopping-sessions-${variant} PRIVATE -mtune=skylake-avx512 -Wa,-mbranches-within-32B-boundaries -fno-semantic-interposition -fno-plt -fomit-frame-pointer)
+        target_compile_options(shopping-sessions-${variant} PRIVATE -mtune=skylake-avx512 -Wa,-mbranches-within-32B-boundaries)
     endforeach()
     target_compile_options(shopping-sessions-avx2 PRIVATE -mavx2 -mbmi -mbmi2 -mpopcnt -mpclmul)
     target_compile_options(shopping-sessions-avx512 PRIVATE -mavx2 -mbmi -mbmi2 -mpopcnt -mpclmul -mavx512f -mavx512bw)

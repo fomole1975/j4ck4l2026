@@ -40,10 +40,10 @@ else
     for target in $profile_targets; do
         dir="opt-$target"
         profile="/tmp/profile-$target"
-        configure "$dir" "-DCMAKE_CXX_FLAGS=-flto=auto -fno-semantic-interposition -fno-plt -fomit-frame-pointer -fprofile-generate=$profile"
+        configure "$dir" "-DCMAKE_CXX_FLAGS=-flto=auto -fprofile-generate=$profile"
         cmake --build "/tmp/$dir" --target "$target" --parallel 4
         NCPU=1 DATA_DIR=/training OUTPUT_DIR=/tmp/train-output "/tmp/$dir/$target"
-        configure "$dir" "-DCMAKE_CXX_FLAGS=-flto=auto -fno-semantic-interposition -fno-plt -fomit-frame-pointer -fprofile-use=$profile -fprofile-correction"
+        configure "$dir" "-DCMAKE_CXX_FLAGS=-flto=auto -fprofile-use=$profile -fprofile-correction"
         cmake --build "/tmp/$dir" --target "$target" --parallel 4
         cmake --install "/tmp/$dir" --component "$target" --strip
         echo "Installed GCC profile-guided binary $target"

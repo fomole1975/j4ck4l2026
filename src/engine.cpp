@@ -1023,12 +1023,14 @@ template <bool Compact> struct UserBlocks {
         ClickRow* clicks;
         uint32_t event_count, click_count;
     };
+    // Unlinked histories already belong to this raw shard.
+    std::vector<Span> singles;
 };
 
-template <bool Compact, class SingleFn>
+template <bool Compact>
 void group_by_raw_id(std::vector<Local>& locals, size_t shard, unsigned shard_bits, const Aliases& aliases,
                      int64_t window_start, UserBlocks<Compact>& blocks,
-                     Partitions<typename UserBlocks<Compact>::Span>& destinations, SingleFn&& on_single) {
+                     Partitions<typename UserBlocks<Compact>::Span>& destinations) {
     size_t ne = 0, nc = 0;
     for (auto& local : locals) {
         ne += local.events[shard].size();
@@ -1181,15 +1183,11 @@ void group_by_raw_id(std::vector<Local>& locals, size_t shard, unsigned shard_bi
         const uint32_t person = aliases.person(group.user);
         using Label = typename UserBlocks<Compact>::Label;
         const auto event_count = group.event_end - first_event, click_count = group.click_end - first_click;
-        if (person == absent) {
-            if (event_count) {
-                on_single(group.user, events.data() + first_event,
-                          click_count ? clicks.data() + first_click : nullptr, event_count, click_count);
-            }
-        } else {
-            destinations[person & mask].push_back(
-                {Label(person), event_count ? events.data() + first_event : nullptr,
-                 click_count ? clicks.data() + first_click : nullptr, event_count, click_count});
+        if (person != absent || event_count) {
+            auto &writer = person == absent ? blocks.singles : destinations[person & mask];
+            writer.push_back({person == absent ? Label(group.user) : Label(person),
+                              event_count ? events.data() + first_event : nullptr,
+                              click_count ? clicks.data() + first_click : nullptr, event_count, click_count});
         }
         if constexpr (Compact) first_event = purchase_ends[id];
         else first_event = group.event_end;
@@ -1312,12 +1310,8 @@ void sessionize(std::vector<Local>& locals, const Aliases& aliases, int64_t star
         }
     };
     parallel_jobs(workers, shards, [&](unsigned worker, size_t shard) {
-        group_by_raw_id<Compact>(
-            locals, shard, std::countr_zero(shards), aliases, start, sources[shard], destinations[worker],
-            [&](Key person_name, EventRow* evs, ClickRow* clks, uint32_t ne, uint32_t nc) {
-                Span single{typename Blocks::Label(person_name), evs, clks, ne, nc};
-                process_histories.template operator()<true>(std::span<Span>(&single, 1), worker, shard);
-            });
+        group_by_raw_id<Compact>(locals, shard, std::countr_zero(shards), aliases, start, sources[shard],
+                                 destinations[worker]);
     });
     const auto shard_bits = std::countr_zero(shards);
     parallel_jobs(workers, shards, [&](unsigned worker, size_t shard) {
@@ -1339,6 +1333,7 @@ void sessionize(std::vector<Local>& locals, const Aliases& aliases, int64_t star
             for (const auto& span : writer[shard])
                 linked[offsets[span.label.person >> shard_bits]++] = span;
         process_histories.template operator()<false>(linked, worker, shard);
+        process_histories.template operator()<true>(sources[shard].singles, worker, shard);
     });
 }
 } // namespace
