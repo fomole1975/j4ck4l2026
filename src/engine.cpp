@@ -33,6 +33,20 @@ int32_t epoch_day(int64_t ts) {
     return static_cast<int32_t>(ts / day_ms - (ts % day_ms < 0));
 }
 
+// PROFILE=1 prints the elapsed time of each named phase.
+std::chrono::steady_clock::time_point& profile_clock() {
+    static auto last = std::chrono::steady_clock::now();
+    return last;
+}
+void profile_mark(const char* name) {
+    static const bool enabled = std::getenv("PROFILE") != nullptr;
+    if (!enabled)
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    std::cerr << name << '=' << std::chrono::duration<double>(now - profile_clock()).count() << "s ";
+    profile_clock() = now;
+}
+
 template <class General, class Basic> struct EventSink {
     General general;
     Basic basic;
@@ -1504,19 +1518,37 @@ void sessionize(std::vector<Local>& locals, const Aliases& aliases, int64_t star
                 EventRow* events = group.events;
                 ClickRow* clicks = group.clicks;
                 if (end != first + 1) {
-                    merged_events.clear();
-                    merged_events.reserve(ne);
-                    merged_clicks.clear();
-                    merged_clicks.reserve(nc);
+                    // Usually one span holds all events and another all clicks;
+                    // only histories split across several spans are copied.
+                    size_t event_spans = 0, click_spans = 0;
                     for (size_t i = first; i < end; ++i) {
-                        const auto& block = spans[i];
-                        if (block.event_count)
-                            merged_events.insert(merged_events.end(), block.events, block.events + block.event_count);
-                        if (block.click_count)
-                            merged_clicks.insert(merged_clicks.end(), block.clicks, block.clicks + block.click_count);
+                        if (spans[i].event_count) {
+                            ++event_spans;
+                            events = spans[i].events;
+                        }
+                        if (spans[i].click_count) {
+                            ++click_spans;
+                            clicks = spans[i].clicks;
+                        }
                     }
-                    events = merged_events.data();
-                    clicks = merged_clicks.data();
+                    if (event_spans > 1) {
+                        merged_events.clear();
+                        merged_events.reserve(ne);
+                        for (size_t i = first; i < end; ++i)
+                            if (spans[i].event_count)
+                                merged_events.insert(merged_events.end(), spans[i].events,
+                                                     spans[i].events + spans[i].event_count);
+                        events = merged_events.data();
+                    }
+                    if (click_spans > 1) {
+                        merged_clicks.clear();
+                        merged_clicks.reserve(nc);
+                        for (size_t i = first; i < end; ++i)
+                            if (spans[i].click_count)
+                                merged_clicks.insert(merged_clicks.end(), spans[i].clicks,
+                                                     spans[i].clicks + spans[i].click_count);
+                        clicks = merged_clicks.data();
+                    }
                 }
                 if constexpr (Compact) {
                     auto& purchases = scratch.purchases;
@@ -1555,6 +1587,7 @@ void sessionize(std::vector<Local>& locals, const Aliases& aliases, int64_t star
         group_by_raw_id<Compact>(locals, shard, std::countr_zero(shards), aliases, start, sources[shard],
                                  destinations[worker], extra_singles != nullptr);
     });
+    profile_mark("group");
     const auto shard_bits = std::countr_zero(shards);
     parallel_jobs(workers, shards, [&](unsigned worker, size_t shard) {
         auto& offsets = workspaces[worker].offsets;
@@ -1596,14 +1629,8 @@ void sessionize(std::vector<Local>& locals, const Aliases& aliases, int64_t star
 } // namespace
 
 std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers, bool allow_index) {
-    auto last = std::chrono::steady_clock::now();
-    auto mark = [&](const char* name) {
-        if (std::getenv("PROFILE")) {
-            auto now = std::chrono::steady_clock::now();
-            std::cerr << name << '=' << std::chrono::duration<double>(now - last).count() << "s ";
-            last = now;
-        }
-    };
+    profile_clock() = std::chrono::steady_clock::now();
+    const auto mark = profile_mark;
     Dimensions dim(input);
     std::optional<Aliases> aliases;
     size_t event_bytes = 0;
@@ -1810,6 +1837,7 @@ std::optional<Result> run_engine_once(const InputFiles& input, unsigned workers,
         sessionize<true>(locals, *aliases, input.window.start, workers, nshards, states, totals, result);
     else
         sessionize<false>(locals, *aliases, input.window.start, workers, nshards, states, totals, result);
+    mark("persons");
     CampaignTotals combined(input.window, dim.campaigns.size());
     for (auto& table : totals)
         table.each([&](int32_t d, uint32_t c, const Totals& t) {
