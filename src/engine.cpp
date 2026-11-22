@@ -313,6 +313,36 @@ uint64_t literal_hash(uint64_t id) {
     return hash ^ (hash >> 32);
 #endif
 }
+// An "e" followed by 32 lowercase hexadecimal digits is exactly a 128-bit value,
+// so such IDs deduplicate by value without storing their bytes.
+struct HexCandidate {
+    uint64_t high, low;
+    int64_t ingest;
+    uint64_t location;
+};
+bool hex_event_id(std::string_view id, uint64_t& high, uint64_t& low) {
+    if (id.size() != 33 || id[0] != 'e')
+        return false;
+    uint64_t words[2] = {0, 0};
+    for (unsigned i = 0; i < 32; ++i) {
+        const unsigned c = static_cast<unsigned char>(id[1 + i]);
+        unsigned d;
+        if (c - '0' < 10)
+            d = c - '0';
+        else if (c - 'a' < 6)
+            d = c - 'a' + 10;
+        else
+            return false;
+        words[i / 16] = (words[i / 16] << 4) | d;
+    }
+    high = words[0];
+    low = words[1];
+    return true;
+}
+uint64_t hex_hash(uint64_t high, uint64_t low) {
+    uint64_t h = (high ^ (low * UINT64_C(0x9e3779b97f4a7c15))) * UINT64_C(0xbf58476d1ce4e5b9);
+    return h ^ (h >> 31);
+}
 struct LiteralCandidate {
     uint64_t id;
     uint32_t seconds, location;
@@ -376,6 +406,7 @@ inline int64_t click_time(const ShortClick& click, int64_t base) { return base -
 template <class T> using Partitions = std::vector<std::vector<T>>;
 struct Local {
     Partitions<Candidate> candidates;
+    Partitions<HexCandidate> hex_candidates;
     Partitions<LiteralCandidate> literals;
     Partitions<WideLiteralCandidate> wide_literals;
     Partitions<Event> events;
@@ -384,7 +415,7 @@ struct Local {
     std::vector<TimedEvent> event_extras;
     std::vector<int64_t> wide_click_times;
 
-    Local(size_t n) : candidates(n), literals(literal_shards), events(n), purchases(n), clicks(n) {}
+    Local(size_t n) : candidates(n), hex_candidates(n), literals(literal_shards), events(n), purchases(n), clicks(n) {}
 
     uint32_t store_click_time(int64_t ts, int64_t base, bool compact) {
         if (compact)
@@ -562,6 +593,33 @@ void deduplicate_literals(std::vector<Local>& locals, size_t shard, const EventL
         select_repeated_literals(locals, shard, count, addresses);
     else if (count)
         select_literal_winners<LiteralCandidate>(locals, shard, count, addresses);
+}
+
+void exclude_duplicate_hex_rows(std::vector<Local>& locals, size_t shard, const EventLocations& addresses) {
+    size_t count = 0;
+    for (auto& local : locals)
+        count += local.hex_candidates[shard].size();
+    if (!count)
+        return;
+    std::vector<const HexCandidate*> seen(std::bit_ceil(count + count / 2 + 1));
+    const size_t mask = seen.size() - 1;
+    for (auto& local : locals) {
+        for (const auto& row : local.hex_candidates[shard]) {
+            size_t i = (hex_hash(row.high, row.low) >> 20) & mask;
+            while (seen[i] && !(seen[i]->high == row.high && seen[i]->low == row.low))
+                i = (i + 1) & mask;
+            if (!seen[i]) {
+                seen[i] = &row;
+            } else if (row.ingest < seen[i]->ingest) {
+                addresses.discard(locals, seen[i]->location);
+                seen[i] = &row;
+            } else {
+                addresses.discard(locals, row.location);
+            }
+        }
+    }
+    for (auto& local : locals)
+        std::vector<HexCandidate>().swap(local.hex_candidates[shard]);
 }
 
 void exclude_duplicate_rows(std::vector<Local>& locals, size_t shard, const EventLocations& addresses) {
@@ -1390,8 +1448,11 @@ Result run_engine(const InputFiles& input, unsigned workers) {
                 local.append_event(shard, user, local.pack(input.window.start, e.ts, {e.price, category}));
             }
             // Even an invalid payload can be the earliest well-formed copy.
+            uint64_t high, low;
             if (const uint64_t literal = e.literal_id ? e.literal_id : event_literal(e.id)) {
                 add_literal(local, literal, e.ingest, location);
+            } else if (hex_event_id(e.id, high, low)) {
+                local.hex_candidates[hex_hash(high, low) & mask].push_back({high, low, e.ingest, location});
             } else {
                 Key id(e.id);
                 local.candidates[id.hash() & mask].push_back({id, e.ingest, location});
@@ -1437,7 +1498,7 @@ Result run_engine(const InputFiles& input, unsigned workers) {
             for (auto &rows : local.clicks)
                 rows.reserve(capacity);
     }
-    parallel_jobs(workers, input.clicks.size() + literal_shards + nshards, [&](unsigned worker, size_t task) {
+    parallel_jobs(workers, input.clicks.size() + literal_shards + 2 * nshards, [&](unsigned worker, size_t task) {
         if (task < input.clicks.size()) {
             auto& local = locals[worker];
             auto general = [&](const ClickInput &c) {
@@ -1462,8 +1523,10 @@ Result run_engine(const InputFiles& input, unsigned workers) {
             for_clicks(input.clicks[task], input.window, sink);
         } else if (task < input.clicks.size() + literal_shards) {
             deduplicate_literals(locals, task - input.clicks.size(), addresses);
-        } else {
+        } else if (task < input.clicks.size() + literal_shards + nshards) {
             exclude_duplicate_rows(locals, task - input.clicks.size() - literal_shards, addresses);
+        } else {
+            exclude_duplicate_hex_rows(locals, task - input.clicks.size() - literal_shards - nshards, addresses);
         }
     });
     mark("clicks+dedup");

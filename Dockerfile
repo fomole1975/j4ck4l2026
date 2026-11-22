@@ -4,7 +4,7 @@ RUN python3 -m venv /opt/tools && /opt/tools/bin/pip install --no-cache-dir --no
 ENV PATH=/opt/tools/bin:$PATH
 
 FROM rust:1.88.0-slim-bookworm@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS training-data
-ADD --checksum=sha256:13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip /tmp/generator.zip
+ADD --checksum=sha256:78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip /tmp/generator.zip
 RUN apt-get update && apt-get install -y --no-install-recommends unzip && rm -rf /var/lib/apt/lists/* \
  && unzip -q /tmp/generator.zip -d /tmp \
  && cargo build --offline --release --manifest-path /tmp/generator/Cargo.toml \

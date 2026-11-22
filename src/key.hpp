@@ -17,6 +17,14 @@ namespace shopping {
 // their bytewise ordering. Other byte strings live in a process-wide pool.
 class Key {
 public:
+    // A byte string that does not pack into 63 bits, stored once per process.
+    struct Interned {
+        uint64_t hash;
+        uint32_t size;
+        const char* data() const { return reinterpret_cast<const char*>(this + 1); }
+    };
+    static_assert(sizeof(Interned) == 16);
+
     Key() = default;
     explicit Key(std::string_view bytes) {
         const size_t n = bytes.size();
@@ -88,7 +96,10 @@ public:
         return view(a) < rhs.view(b);
     }
     std::string_view view(char (&storage)[9]) const {
-        if (bits_ & tag) return *reinterpret_cast<const std::string*>(bits_ & ~tag);
+        if (bits_ & tag) {
+            const auto* entry = reinterpret_cast<const Interned*>(bits_ & ~tag);
+            return {entry->data(), entry->size};
+        }
         size_t size = 0;
         uint64_t x = bits_;
         while (x != 0) {
