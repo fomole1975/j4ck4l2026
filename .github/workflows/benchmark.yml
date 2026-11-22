@@ -31,11 +31,11 @@ jobs:
           unzip -q generator.zip
           cargo build --offline --release --manifest-path generator/Cargo.toml
           generator/target/release/generate --seed 32741 --events 20000000 --clicks 5000000 --output practice
-          generator/target/release/generate --seed 817331 --events 60000000 --clicks 15000000 --output final
+          if [ -n "${{ inputs.compare_commit }}" ]; then generator/target/release/generate --seed 817331 --events 60000000 --clicks 15000000 --output final; fi
       - name: Build scoring image and inspect host CPU
         run: |
-          lscpu | grep -E 'Model name|^CPU\(s\)|Thread'
-          docker build --platform linux/amd64 -t shopping-sessions .
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|L2|L3'
+          if [ -n "${{ inputs.compare_commit }}" ]; then docker build --platform linux/amd64 -t shopping-sessions .; fi
       - name: Build comparison image
         if: inputs.compare_commit != ''
         env:
@@ -46,6 +46,10 @@ jobs:
           git worktree add --detach "$WORK/base-source" FETCH_HEAD
           docker build --platform linux/amd64 -t shopping-baseline "$WORK/base-source"
       - name: Per-phase timings
+        if: inputs.compare_commit != ''
         env:
           BASE_SHA: ${{ inputs.compare_commit }}
         run: python3 .github/scripts/diagnose.py
+      - name: CPU profile of this branch
+        if: inputs.compare_commit == ''
+        run: bash .github/scripts/profile.sh
